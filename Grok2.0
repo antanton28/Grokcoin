@@ -1,0 +1,335 @@
+use blake3;
+use rayon::prelude::*;
+use sha2::{Sha256, Digest};
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+use rand::Rng;
+use rocksdb::{DB, Options};
+use tokio::{net::UdpSocket, task};
+use quinn::{Endpoint, ServerConfig, ClientConfig};
+use zstd::{encode_all, decode_all};
+
+const SHARD_COUNT: u64 = 640;
+const TARGET_BLOCK_TIME: f64 = 0.1; // ~0.1s laptop, ~30s phone
+const MAX_STATE_SIZE: usize = 20 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Transaction {
+    sender: String,
+    receiver: String,
+    amount: u64,
+    contract: Option<Vec<u8>>,
+    gas: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Block {
+    shard_id: u64,
+    prev_hash: String,
+    transactions: Vec<Transaction>,
+    timestamp: u64,
+    nonce: u64,
+    hash: String,
+    merkle_root: String,
+    difficulty: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Shard {
+    blocks: Vec<Block>,
+    balances: HashMap<String, u64>,
+    state: HashMap<String, Vec<u8>>,
+}
+
+struct GrokChain {
+    shards: Vec<Shard>,
+    poh_chain: String,
+    db: Arc<DB>,
+    peers: Vec<String>,
+}
+
+impl GrokChain {
+    fn new(peers: Vec<String>) -> Self {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = Arc::new(DB::open(&opts, "grokchain_db").unwrap());
+        let shards = (0..SHARD_COUNT).map(Self::init_shard).collect();
+        GrokChain {
+            shards,
+            poh_chain: Self::init_poh(),
+            db,
+            peers,
+        }
+    }
+
+    fn init_shard(shard_id: u64) -> Shard {
+        Shard {
+            blocks: vec![Self::genesis_block(shard_id)],
+            balances: HashMap::new(),
+            state: HashMap::new(),
+        }
+    }
+
+    fn genesis_block(shard_id: u64) -> Block {
+        Block {
+            shard_id,
+            prev_hash: "0".to_string(),
+            transactions: Vec::new(),
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            nonce: 0,
+            hash: format!("00genesis{}", shard_id),
+            merkle_root: "0".to_string(),
+            difficulty: 4,
+        }
+    }
+
+    fn init_poh() -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"GrokChain v3 PoH Seed");
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn adjust_difficulty(&self, shard_id: u64) -> u32 {
+        let shard = &self.shards[shard_id as usize];
+        let last_block = shard.blocks.last().unwrap();
+        if shard.blocks.len() < 2 { return last_block.difficulty; }
+        let prev_block = &shard.blocks[shard.blocks.len() - 2];
+        let time_diff = (last_block.timestamp - prev_block.timestamp) as f64 / 1000.0; // ms to s
+        let diff = last_block.difficulty as f64;
+        let ratio = TARGET_BLOCK_TIME / time_diff.max(0.01); // Avoid division by zero
+        (diff * ratio.clamp(0.5, 2.0)).max(4.0) as u32 // Minimum difficulty 4
+    }
+
+    fn mine_block(&self, shard_id: u64, txs: Vec<Transaction>) -> Block {
+        let shard = &self.shards[shard_id as usize];
+        let prev_block = shard.blocks.last().unwrap();
+        let prev_hash = prev_block.hash.clone();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let mut nonce = 0;
+        let merkle_root = Self::compute_merkle_root(&txs);
+        let poh = self.poh_chain.clone();
+        let difficulty = self.adjust_difficulty(shard_id);
+
+        loop {
+            let hash_input = format!("{}{}{}{}", prev_hash, timestamp, nonce, poh);
+            let hash = format!("{:x}", blake3::hash(hash_input.as_bytes()));
+            if &hash[..difficulty as usize] == &"0".repeat(difficulty as usize) {
+                return Block {
+                    shard_id,
+                    prev_hash,
+                    transactions: txs,
+                    timestamp,
+                    nonce,
+                    hash,
+                    merkle_root,
+                    difficulty,
+                };
+            }
+            nonce += 1;
+        }
+    }
+
+    fn compute_merkle_root(txs: &[Transaction]) -> String {
+        if txs.is_empty() { return "0".to_string(); }
+        let mut hashes: Vec<_> = txs.par_iter()
+            .map(|tx| format!("{:x}", blake3::hash(&bincode::serialize(tx).unwrap())))
+            .collect();
+        while hashes.len() > 1 {
+            hashes = hashes.par_chunks(2)
+                .map(|chunk| {
+                    let combined = if chunk.len() == 2 { chunk[0].clone() + &chunk[1] } else { chunk[0].clone() };
+                    format!("{:x}", blake3::hash(combined.as_bytes()))
+                })
+                .collect();
+        }
+        hashes[0].clone()
+    }
+
+    fn process_tx(&mut self, shard_id: u64, tx: Transaction) -> bool {
+        let shard = &mut self.shards[shard_id as usize];
+        let sender_bal = shard.balances.entry(tx.sender.clone()).or_insert(10000);
+        if *sender_bal < tx.amount || tx.gas > 10000 { return false; }
+        *sender_bal -= tx.amount;
+        *shard.balances.entry(tx.receiver.clone()).or_insert(0) += tx.amount;
+        if let Some(code) = tx.contract {
+            return self.execute_contract(shard_id, code, tx.amount, tx.gas);
+        }
+        true
+    }
+
+    fn execute_contract(&mut self, shard_id: u64, code: Vec<u8>, value: u64, gas: u64) -> bool {
+        let shard = &mut self.shards[shard_id as usize];
+        let mut stack: Vec<u64> = Vec::new();
+        let mut gas_used = 0;
+        let mut pc = 0;
+
+        while pc < code.len() {
+            let op = code[pc];
+            gas_used += match op {
+                0x01 => { stack.push(value); 1 } // PUSH value
+                0x02 => { // ADD
+                    if stack.len() < 2 { return false; }
+                    let b = stack.pop().unwrap();
+                    let a = stack.pop().unwrap();
+                    stack.push(a.wrapping_add(b));
+                    3
+                }
+                0x03 => { // STORE
+                    if stack.is_empty() { return false; }
+                    let val = stack.pop().unwrap();
+                    shard.state.insert("data".to_string(), vec![val as u8]);
+                    5
+                }
+                0x04 => { // LOAD
+                    if let Some(data) = shard.state.get("data") {
+                        stack.push(data[0] as u64);
+                    } else {
+                        stack.push(0);
+                    }
+                    3
+                }
+                _ => 10, // Unknown op
+            };
+            if gas_used > gas { return false; }
+            pc += 1;
+        }
+        true
+    }
+
+    fn verify_chain(&self, shard_id: u64) -> bool {
+        let shard = &self.shards[shard_id as usize];
+        for i in 1..shard.blocks.len() {
+            let block = &shard.blocks[i];
+            let prev = &shard.blocks[i - 1];
+            let hash_input = format!("{}{}{}{}", prev.hash, block.timestamp, block.nonce, &self.poh_chain);
+            if format!("{:x}", blake3::hash(hash_input.as_bytes())) != block.hash {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn save_state(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let data = bincode::serialize(&self.shards)?;
+        let compressed = encode_all(&data[..], 3)?;
+        self.db.put("grokchain_state", &compressed)?;
+        Ok(())
+    }
+
+    fn load_state(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(bytes) = self.db.get("grokchain_state")? {
+            let decompressed = decode_all(&bytes[..])?;
+            self.shards = bincode::deserialize(&decompressed)?;
+        }
+        Ok(())
+    }
+
+    async fn broadcast_block(&self, block: Block) -> Result<(), Box<dyn std::error::Error>> {
+        let data = bincode::serialize(&block)?;
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        for peer in &self.peers {
+            socket.send_to(&data, peer).await?;
+        }
+        Ok(())
+    }
+}
+
+async fn run_p2p_server(chain: Arc<Mutex<GrokChain>>) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = "127.0.0.1:9000";
+    let socket = UdpSocket::bind(addr).await?;
+    let mut buf = [0u8; 4096];
+    println!("P2P server running on {}", addr);
+
+    loop {
+        let (len, peer) = socket.recv_from(&mut buf).await?;
+        let handshake = &buf[..4];
+        if handshake != b"GRK3" { // Simple handshake
+            println!("Invalid handshake from {}", peer);
+            continue;
+        }
+        if let Ok(block) = bincode::deserialize::<Block>(&buf[4..len]) {
+            let mut chain = chain.lock().unwrap();
+            chain.shards[block.shard_id as usize].blocks.push(block);
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let peers = vec!["127.0.0.1:9001".to_string()];
+    let chain = Arc::new(Mutex::new(GrokChain::new(peers)));
+    let chain_clone = chain.clone();
+
+    task::spawn(run_p2p_server(chain_clone));
+
+    let mut chain = chain.lock().unwrap();
+    chain.load_state()?;
+    println!("GrokChain v3 launched - PoH: {}", chain.poh_chain);
+
+    let txs = vec![
+        Transaction {
+            sender: "Alice".to_string(),
+            receiver: "Bob".to_string(),
+            amount: 100,
+            contract: None,
+            gas: 100,
+        },
+        Transaction {
+            sender: "Bob".to_string(),
+            receiver: "Charlie".to_string(),
+            amount: 50,
+            contract: Some(vec![0x01, 0x02, 0x03, 0x04]), // PUSH, ADD, STORE, LOAD
+            gas: 200,
+        },
+    ];
+
+    println!("Mining block in shard 0...");
+    let start = SystemTime::now();
+    let block = chain.mine_block(0, txs.clone());
+    chain.shards[0].blocks.push(block.clone());
+    chain.broadcast_block(block).await?;
+    for tx in txs {
+        chain.process_tx(0, tx);
+    }
+    let elapsed = start.elapsed().unwrap().as_secs_f64();
+    println!("Mined block: {:?}", chain.shards[0].blocks.last());
+    println!("Time: {:.2}s", elapsed);
+
+    let tx_per_shard = 1562;
+    let mut total_txs = 0;
+    let start = SystemTime::now();
+    for shard_id in 0..SHARD_COUNT {
+        for _ in 0..tx_per_shard {
+            let tx = Transaction {
+                sender: "User".to_string(),
+                receiver: "Other".to_string(),
+                amount: 1,
+                contract: None,
+                gas: 100,
+            };
+            if chain.process_tx(shard_id, tx) { total_txs += 1; }
+        }
+    }
+    let elapsed = start.elapsed().unwrap().as_secs_f64();
+    let tps = total_txs as f64 / elapsed;
+    println!("Processed {} txs in {:.2}s - TPS: {:.0}", total_txs, elapsed, tps);
+
+    if chain.verify_chain(0) {
+        println!("Shard 0 chain integrity verified!");
+    } else {
+        println!("Shard 0 chain integrity check failed!");
+    }
+
+    let shard = &chain.shards[0];
+    println!("Balances: Alice: {}, Bob: {}, Charlie: {}, Contract: {}", 
+             shard.balances.get("Alice").unwrap_or(&0),
+             shard.balances.get("Bob").unwrap_or(&0),
+             shard.balances.get("Charlie").unwrap_or(&0),
+             shard.balances.get("Contract").unwrap_or(&0));
+    println!("Contract storage: {:?}", shard.state.get("data"));
+
+    chain.save_state()?;
+    Ok(())
+}
