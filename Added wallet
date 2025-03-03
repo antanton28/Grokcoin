@@ -1,0 +1,112 @@
+use secp256k1::{Secp256k1, SecretKey, PublicKey, Message};
+use sqlite::Connection;
+
+// Add to Transaction struct
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Transaction {
+    sender: String, // Address from pubkey
+    receiver: String,
+    amount: u64,
+    contract: Option<Vec<u8>>,
+    gas: u64,
+    signature: Option<Vec<u8>>, // ECDSA signature
+}
+
+// Add Wallet struct
+struct GrokWallet {
+    private_key: SecretKey,
+    public_key: PublicKey,
+    address: String,
+    db: Connection,
+    shard_id: u64,
+}
+
+impl GrokWallet {
+    fn new(shard_id: u64) -> Self {
+        let secp = Secp256k1::new();
+        let private_key = SecretKey::new(&mut rand::thread_rng());
+        let public_key = PublicKey::from_secret_key(&secp, &private_key);
+        let address = format!("Grok{}", blake3::hash(&public_key.serialize()).to_hex()[..20]);
+        let db = Connection::open("grok_wallet.db").unwrap();
+        db.execute("CREATE TABLE IF NOT EXISTS headers (shard_id INTEGER, hash TEXT, height INTEGER)").unwrap();
+        db.execute("CREATE TABLE IF NOT EXISTS txs (tx_hash TEXT, amount INTEGER, sender TEXT, receiver TEXT)").unwrap();
+        GrokWallet { private_key, public_key, address, db, shard_id }
+    }
+
+    fn sync(&self, chain: &GrokChain) {
+        let shard = &chain.shards[self.shard_id as usize];
+        for block in &shard.blocks {
+            self.db.execute(format!(
+                "INSERT OR IGNORE INTO headers (shard_id, hash, height) VALUES ({}, '{}', {})",
+                self.shard_id, block.hash, shard.blocks.len()
+            )).unwrap();
+            for tx in &block.transactions {
+                if tx.receiver == self.address || tx.sender == self.address {
+                    self.db.execute(format!(
+                        "INSERT INTO txs (tx_hash, amount, sender, receiver) VALUES ('{}', {}, '{}', '{}')",
+                        blake3::hash(&bincode::serialize(tx).unwrap()).to_hex(), tx.amount, tx.sender, tx.receiver
+                    )).unwrap();
+                }
+            }
+        }
+    }
+
+    fn balance(&self) -> u64 {
+        let mut balance = 0;
+        let stmt = self.db.prepare("SELECT amount, sender, receiver FROM txs").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            let amount: i64 = row.get(0).unwrap();
+            let sender: String = row.get(1).unwrap();
+            let receiver: String = row.get(2).unwrap();
+            if receiver == self.address { balance += amount as u64; }
+            if sender == self.address { balance -= amount as u64; }
+        }
+        balance
+    }
+
+    fn send(&self, receiver: String, amount: u64, chain: &mut GrokChain) -> Transaction {
+        let secp = Secp256k1::new();
+        let tx = Transaction {
+            sender: self.address.clone(),
+            receiver,
+            amount,
+            contract: None,
+            gas: 100,
+            signature: None,
+        };
+        let tx_hash = blake3::hash(&bincode::serialize(&tx).unwrap());
+        let message = Message::from_slice(&tx_hash.as_bytes()).unwrap();
+        let sig = secp.sign_ecdsa(&message, &self.private_key);
+        let mut signed_tx = tx;
+        signed_tx.signature = Some(sig.serialize_compact().to_vec());
+        chain.process_tx(self.shard_id, signed_tx.clone());
+        signed_tx
+    }
+}
+
+// Update GrokChain methods
+impl GrokChain {
+    fn process_tx(&mut self, shard_id: u64, tx: Transaction) -> bool {
+        let shard = &mut self.shards[shard_id as usize];
+        let secp = Secp256k1::new();
+        if let Some(sig_bytes) = &tx.signature {
+            let tx_hash = blake3::hash(&bincode::serialize(&Transaction {
+                sender: tx.sender.clone(), receiver: tx.receiver.clone(), amount: tx.amount, 
+                contract: tx.contract.clone(), gas: tx.gas, signature: None
+            }).unwrap());
+            let message = Message::from_slice(&tx_hash.as_bytes()).unwrap();
+            let pubkey = PublicKey::from_str(&tx.sender[4..]).unwrap(); // Simplified parsing
+            let sig = secp256k1::ecdsa::Signature::from_compact(sig_bytes).unwrap();
+            if secp.verify_ecdsa(&message, &sig, &pubkey).is_err() { return false; }
+        }
+        // Rest of process_tx as before
+        let sender_bal = shard.balances.entry(tx.sender.clone()).or_insert(10000);
+        if *sender_bal < tx.amount || tx.gas > 10000 { return false; }
+        *sender_bal -= tx.amount;
+        *shard.balances.entry(tx.receiver.clone()).or_insert(0) += tx.amount;
+        if let Some(code) = tx.contract { self.execute_contract(shard_id, code, tx.amount, tx.gas) } else { true }
+    }
+
+    // Add to broadcast_block and main as needed
+}
