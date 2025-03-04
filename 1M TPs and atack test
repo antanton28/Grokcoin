@@ -1,0 +1,429 @@
+use blake3;
+use ed25519_dalek::{Keypair, Signer, Verifier, PublicKey, Signature};
+use serde::{Serialize, Deserialize};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use rocksdb::{DB, Options};
+use rand::rngs::OsRng;
+use std::thread;
+use sha2::{Sha256, Digest};
+
+const MAX_TXS_PER_BLOCK: usize = 1000;
+const BAN_DURATION: u64 = 30 * 60; // 30 minute
+const RATE_LIMIT: usize = 5; // Max 5 blocuri/secundă/IP
+const BLOCK_REWARD: u64 = 10; // 10 GROK/block
+const TX_FEE_PERCENT: f64 = 0.01; // 1% taxe
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Transaction {
+    sender: String,
+    receiver: String,
+    amount: u64,
+    id: u64,
+    signature: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Block {
+    prev_hash: String,
+    transactions: Vec<Transaction>,
+    timestamp: u64,
+    nonce: u64,
+    hash: String,
+    difficulty: u32,
+    miner_ip: String,
+    poh_index: usize,
+    fees: u64, // Taxe colectate
+}
+
+struct GrokChainSim {
+    db: Arc<DB>,
+    balances: Arc<Mutex<HashMap<String, u64>>>, // Solduri tranzacții
+    grok_balances: Arc<Mutex<HashMap<String, u64>>>, // Solduri GROK
+    keypair: Keypair,
+    poh_chain: Arc<Mutex<Vec<String>>>,
+    blacklist: Arc<Mutex<HashMap<String, u64>>>,
+    failed_attempts: Arc<Mutex<HashMap<String, usize>>>,
+    rate_limiter: Arc<Mutex<HashMap<String, Vec<u64>>>>,
+    peers: Vec<String>,
+}
+
+impl GrokChainSim {
+    fn new(peers: Vec<String>) -> Self {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = Arc::new(DB::open(&opts, "grokchain_db").unwrap());
+        let poh_chain = vec![format!("{:x}", Sha256::digest(b"GrokChain PoH Seed"))];
+        let genesis = Block {
+            prev_hash: "0".to_string(),
+            transactions: vec![],
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            nonce: 0,
+            hash: "00genesis".to_string(),
+            difficulty: 4,
+            miner_ip: "127.0.0.1".to_string(),
+            poh_index: 0,
+            fees: 0,
+        };
+        db.put(b"block_0", &bincode::serialize(&genesis).unwrap()).unwrap();
+
+        GrokChainSim {
+            db,
+            balances: Arc::new(Mutex::new(HashMap::new())),
+            grok_balances: Arc::new(Mutex::new(HashMap::new())),
+            keypair: Keypair::generate(&mut OsRng),
+            poh_chain: Arc::new(Mutex::new(poh_chain)),
+            blacklist: Arc::new(Mutex::new(HashMap::new())),
+            failed_attempts: Arc::new(Mutex::new(HashMap::new())),
+            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            peers,
+        }
+    }
+
+    fn update_poh(&self, txs: &[Transaction]) -> usize {
+        let mut poh = self.poh_chain.lock().unwrap();
+        let last_poh = poh.last().unwrap().clone();
+        let mut hasher = Sha256::new();
+        hasher.update(last_poh.as_bytes());
+        for tx in txs {
+            hasher.update(bincode::serialize(tx).unwrap());
+        }
+        let new_poh = format!("{:x}", hasher.finalize());
+        poh.push(new_poh);
+        poh.len() - 1
+    }
+
+    fn mine_block(&self, txs: Vec<Transaction>, miner_ip: &str) -> Result<Block, String> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+        let blacklist = self.blacklist.lock().unwrap();
+        if let Some(ban_time) = blacklist.get(miner_ip) {
+            if now < *ban_time {
+                return Err(format!("IP {} is banned until {}", miner_ip, ban_time));
+            }
+        }
+        drop(blacklist);
+
+        let mut limiter = self.rate_limiter.lock().unwrap();
+        let timestamps = limiter.entry(miner_ip.to_string()).or_insert(Vec::new());
+        timestamps.retain(|&t| now - t < 1);
+        if timestamps.len() >= RATE_LIMIT {
+            return Err(format!("IP {} exceeded rate limit ({} blocks/sec)", miner_ip, RATE_LIMIT));
+        }
+        timestamps.push(now);
+        drop(limiter);
+
+        let block_count = self.get_block_count();
+        let prev_block: Block = bincode::deserialize(&self.db.get(format!("block_{}", block_count - 1)).unwrap().unwrap()).unwrap();
+        let prev_hash = prev_block.hash.clone();
+        let timestamp = now;
+        let mut nonce = 0;
+        let difficulty = 4;
+        let poh_index = self.update_poh(&txs);
+
+        let fees = txs.iter().map(|tx| (tx.amount as f64 * TX_FEE_PERCENT) as u64).sum();
+
+        loop {
+            let poh = self.poh_chain.lock().unwrap()[poh_index].clone();
+            let hash_input = format!("{}{}{}{}", prev_hash, timestamp, nonce, poh);
+            let hash = format!("{:x}", blake3::hash(hash_input.as_bytes()));
+            if &hash[..difficulty as usize] == &"0".repeat(difficulty as usize) {
+                let block = Block {
+                    prev_hash,
+                    transactions: txs,
+                    timestamp,
+                    nonce,
+                    hash,
+                    difficulty,
+                    miner_ip: miner_ip.to_string(),
+                    poh_index,
+                    fees,
+                };
+                if self.verify_block(&block) {
+                    let mut grok_balances = self.grok_balances.lock().unwrap();
+                    let miner_bal = grok_balances.entry(miner_ip.to_string()).or_insert(0);
+                    *miner_bal += BLOCK_REWARD + fees;
+                    return Ok(block);
+                } else {
+                    let mut attempts = self.failed_attempts.lock().unwrap();
+                    let count = attempts.entry(miner_ip.to_string()).or_insert(0);
+                    *count += 1;
+                    if *count >= 10 {
+                        let mut blacklist = self.blacklist.lock().unwrap();
+                        blacklist.insert(miner_ip.to_string(), now + BAN_DURATION);
+                        println!("IP {} banned for 30 minutes due to repeated invalid blocks!", miner_ip);
+                    }
+                    return Err("Invalid block rejected".to_string());
+                }
+            }
+            nonce += 1;
+        }
+    }
+
+    fn update_balances(&self, block: &Block) -> Result<(), String> {
+        let mut balances = self.balances.lock().unwrap();
+        let mut seen_ids = HashSet::new();
+
+        for tx in &block.transactions {
+            let tx_bytes = bincode::serialize(&Transaction {
+                sender: tx.sender.clone(),
+                receiver: tx.receiver.clone(),
+                amount: tx.amount,
+                id: tx.id,
+                signature: vec![],
+            }).unwrap();
+            let public_key = self.keypair.public;
+            let signature = Signature::from_bytes(&tx.signature).unwrap();
+            if public_key.verify(&tx_bytes, &signature).is_err() {
+                return Err(format!("Invalid signature for tx ID {}", tx.id));
+            }
+            if !seen_ids.insert(tx.id) {
+                return Err(format!("Double-spending detected: tx ID {}", tx.id));
+            }
+
+            let fee = (tx.amount as f64 * TX_FEE_PERCENT) as u64;
+            let sender_bal = balances.entry(tx.sender.clone()).or_insert(10000);
+            let total_cost = tx.amount + fee;
+            if *sender_bal < total_cost {
+                return Err(format!("Insufficient balance for {}: {} < {}", tx.sender, sender_bal, total_cost));
+            }
+            *sender_bal -= total_cost;
+            *balances.entry(tx.receiver.clone()).or_insert(0) += tx.amount;
+        }
+        Ok(())
+    }
+
+    fn verify_block(&self, block: &Block) -> bool {
+        let poh = self.poh_chain.lock().unwrap();
+        if block.poh_index >= poh.len() {
+            return false;
+        }
+        let hash_input = format!("{}{}{}{}", block.prev_hash, block.timestamp, block.nonce, poh[block.poh_index]);
+        if format!("{:x}", blake3::hash(hash_input.as_bytes())) != block.hash {
+            return false;
+        }
+        let prev_block: Option<Block> = self.db.get(format!("block_{}", self.get_block_count() - 1))
+            .unwrap()
+            .map(|b| bincode::deserialize(&b).unwrap());
+        if let Some(pb) = prev_block {
+            if pb.hash != block.prev_hash {
+                return false;
+            }
+        }
+        self.update_balances(block).is_ok()
+    }
+
+    fn get_block_count(&self) -> usize {
+        let mut count = 0;
+        while self.db.get(format!("block_{}", count).as_bytes()).unwrap().is_some() {
+            count += 1;
+        }
+        count
+    }
+
+    fn process_transactions(&self, total_txs: usize, tx_pool: Vec<Transaction>, miner_ip: &str) -> Result<(), String> {
+        let block = self.mine_block(tx_pool, miner_ip)?;
+        let block_count = self.get_block_count();
+        self.db.put(format!("block_{}", block_count).as_bytes(), &bincode::serialize(&block).unwrap()).unwrap();
+        Ok(())
+    }
+}
+
+fn simulate_attacks(chain: Arc<GrokChainSim>, total_txs: usize) {
+    let mut handles = Vec::new();
+    let txs_per_block = total_txs / MAX_TXS_PER_BLOCK;
+
+    // IP1: Double-spending
+    handles.push(thread::spawn({
+        let chain = chain.clone();
+        move || {
+            let mut tx_id = 0;
+            for _ in 0..txs_per_block {
+                let mut tx_pool = Vec::new();
+                for i in 0..MAX_TXS_PER_BLOCK {
+                    let mut tx = Transaction {
+                        sender: if i % 2 == 0 { "Hacker1".to_string() } else { format!("User{}", tx_id) },
+                        receiver: "Victim".to_string(),
+                        amount: 1,
+                        id: tx_id,
+                        signature: vec![],
+                    };
+                    let tx_bytes = bincode::serialize(&tx).unwrap();
+                    tx.signature = chain.keypair.sign(&tx_bytes).to_bytes().to_vec();
+                    tx_pool.push(tx);
+                    if i % 2 == 0 {
+                        tx_pool.push(tx.clone());
+                    }
+                    tx_id += 1;
+                }
+                if let Err(e) = chain.process_transactions(MAX_TXS_PER_BLOCK, tx_pool, "192.168.1.101") {
+                    println!("IP1 (Double-spending): {}", e);
+                }
+            }
+        }
+    }));
+
+    // IP2: Flooding
+    handles.push(thread::spawn({
+        let chain = chain.clone();
+        move || {
+            for _ in 0..txs_per_block {
+                let mut tx_pool = Vec::new();
+                for i in 0..MAX_TXS_PER_BLOCK {
+                    let mut tx = Transaction {
+                        sender: format!("Flood{}", i),
+                        receiver: "Nobody".to_string(),
+                        amount: 999999,
+                        id: i as u64,
+                        signature: vec![],
+                    };
+                    let tx_bytes = bincode::serialize(&tx).unwrap();
+                    tx.signature = chain.keypair.sign(&tx_bytes).to_bytes().to_vec();
+                    tx_pool.push(tx);
+                }
+                if let Err(e) = chain.process_transactions(MAX_TXS_PER_BLOCK, tx_pool, "192.168.1.102") {
+                    println!("IP2 (Flooding): {}", e);
+                }
+            }
+        }
+    }));
+
+    // IP3: Hash spoofing
+    handles.push(thread::spawn({
+        let chain = chain.clone();
+        move || {
+            let mut tx_id = 0;
+            for _ in 0..txs_per_block {
+                let mut tx_pool = Vec::new();
+                for i in 0..MAX_TXS_PER_BLOCK {
+                    let mut tx = Transaction {
+                        sender: format!("User{}", tx_id),
+                        receiver: "Other".to_string(),
+                        amount: 1,
+                        id: tx_id,
+                        signature: vec![],
+                    };
+                    let tx_bytes = bincode::serialize(&tx).unwrap();
+                    tx.signature = chain.keypair.sign(&tx_bytes).to_bytes().to_vec();
+                    tx_pool.push(tx);
+                    tx_id += 1;
+                }
+                let block_count = chain.get_block_count();
+                let prev_block: Block = bincode::deserialize(&chain.db.get(format!("block_{}", block_count - 1)).unwrap().unwrap()).unwrap();
+                let fake_block = Block {
+                    prev_hash: prev_block.hash.clone(),
+                    transactions: tx_pool,
+                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                    nonce: 0,
+                    hash: "00fakehash".to_string(),
+                    difficulty: 4,
+                    miner_ip: "192.168.1.103".to_string(),
+                    poh_index: chain.poh_chain.lock().unwrap().len() - 1,
+                    fees: 0,
+                };
+                chain.db.put(format!("block_{}", block_count).as_bytes(), &bincode::serialize(&fake_block).unwrap()).unwrap();
+                if !chain.verify_block(&fake_block) {
+                    println!("IP3 (Hash spoofing): Fake block rejected");
+                }
+            }
+        }
+    }));
+
+    // IP4: Balance overflow
+    handles.push(thread::spawn({
+        let chain = chain.clone();
+        move || {
+            let mut tx_id = 0;
+            for _ in 0..txs_per_block {
+                let mut tx_pool = Vec::new();
+                for _ in 0..MAX_TXS_PER_BLOCK {
+                    let mut tx = Transaction {
+                        sender: "Hacker4".to_string(),
+                        receiver: "Victim".to_string(),
+                        amount: u64::MAX,
+                        id: tx_id,
+                        signature: vec![],
+                    };
+                    let tx_bytes = bincode::serialize(&tx).unwrap();
+                    tx.signature = chain.keypair.sign(&tx_bytes).to_bytes().to_vec();
+                    tx_pool.push(tx);
+                    tx_id += 1;
+                }
+                if let Err(e) = chain.process_transactions(MAX_TXS_PER_BLOCK, tx_pool, "192.168.1.104") {
+                    println!("IP4 (Balance overflow): {}", e);
+                }
+            }
+        }
+    }));
+
+    // IP5: Chain rewrite
+    handles.push(thread::spawn({
+        let chain = chain.clone();
+        move || {
+            let mut tx_id = 0;
+            for _ in 0..txs_per_block {
+                let mut tx_pool = Vec::new();
+                for i in 0..MAX_TXS_PER_BLOCK {
+                    let mut tx = Transaction {
+                        sender: format!("User{}", tx_id),
+                        receiver: "Other".to_string(),
+                        amount: 1,
+                        id: tx_id,
+                        signature: vec![],
+                    };
+                    let tx_bytes = bincode::serialize(&tx).unwrap();
+                    tx.signature = chain.keypair.sign(&tx_bytes).to_bytes().to_vec();
+                    tx_pool.push(tx);
+                    tx_id += 1;
+                }
+                let block = chain.mine_block(tx_pool.clone(), "192.168.1.105").unwrap();
+                chain.db.put(b"block_1", &bincode::serialize(&block).unwrap()).unwrap();
+                println!("IP5 (Chain rewrite): Attempted to rewrite block 1");
+            }
+        }
+    }));
+
+    // Procesare legitimă cu recompense
+    let chain_clone = chain.clone();
+    handles.push(thread::spawn(move || {
+        let mut tx_id = 0;
+        let start = SystemTime::now();
+        for _ in 0..10000 {
+            let mut tx_pool = Vec::new();
+            for i in 0..MAX_TXS_PER_BLOCK {
+                let mut tx = Transaction {
+                    sender: format!("User{}", tx_id),
+                    receiver: "Other".to_string(),
+                    amount: 100, // Valoare mai mare pentru taxe vizibile
+                    id: tx_id,
+                    signature: vec![],
+                };
+                let tx_bytes = bincode::serialize(&tx).unwrap();
+                tx.signature = chain_clone.keypair.sign(&tx_bytes).to_bytes().to_vec();
+                tx_pool.push(tx);
+                tx_id += 1;
+            }
+            if let Err(e) = chain_clone.process_transactions(MAX_TXS_PER_BLOCK, tx_pool, "127.0.0.1") {
+                println!("Legit processing failed: {}", e);
+            }
+        }
+        let elapsed = start.elapsed().unwrap().as_secs_f64();
+        let grok_bal = chain_clone.grok_balances.lock().unwrap().get("127.0.0.1").unwrap_or(&0);
+        println!("Legit processed 10M txs in {:.2}s - TPS: {:.0}, Miner GROK: {}", elapsed, 10_000_000.0 / elapsed, grok_bal);
+    }));
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
+fn main() {
+    let peers = vec!["127.0.0.1:9001".to_string()];
+    let chain = Arc::new(GrokChainSim::new(peers));
+    println!("\n=== Multi-Attack Simulation with Rewards ===");
+    simulate_attacks(chain.clone(), 10_000_000);
+
+    let block_count = chain.get_block_count();
+    println!("Final chain length: {}", block_count);
+}
